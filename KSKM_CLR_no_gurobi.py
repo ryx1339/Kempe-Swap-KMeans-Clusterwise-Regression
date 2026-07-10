@@ -414,10 +414,11 @@ def Assign_Singletons_and_Cliques(membership, sub_adjs, D, n_s, eps = 1e-6):
     best_j = np.argmin(D_verts, axis=1) 
     current_j = membership[verts]
     # move_mask = (current_j != best_j)
-    best_cost = D[verts, best_j[verts]]
-    current_cost = D[verts, current_j]
+    row_idx = np.arange(len(verts))
+    best_cost = D_verts[row_idx, best_j]
+    current_cost = D_verts[row_idx, current_j]
 
-    move_mask = (best_j[verts] != current_j) & (best_cost < current_cost - eps)
+    move_mask = (best_j != current_j) & (best_cost < current_cost - eps)
 
     moved_verts = verts[move_mask]
     if moved_verts.size:
@@ -963,11 +964,15 @@ def KSKM(random_state, X, Y, ml_supernodes, cl_supernodes, steps_mutation, k, st
     print('Preprocessing Done')
     
     if membership is None:
-        membership = DSATUR(n_supernodes, sub_adjs, k)
-        if not len(membership):
+        membership = DSATUR(n_supernodes, sub_adjs)
+
+    if k is None:
+        k = membership.max() + 5
+        print('number of clusters k = ', k)
+    else:
+        if membership.max() >= k:
             print('DSATUR solution infeasible')
             return []
-        print(membership.max())
 
     if verbose:
         print('Initialization done')
@@ -977,7 +982,7 @@ def KSKM(random_state, X, Y, ml_supernodes, cl_supernodes, steps_mutation, k, st
     
     return membership_final, membership
 
-def DSATUR(n_supernodes, sub_adjs, k):
+def DSATUR(n_supernodes, sub_adjs):
     membership = np.zeros(n_supernodes, dtype = np.int64)
     for verts in sub_adjs['cliques']:
         for i, v in enumerate(verts):
@@ -985,13 +990,12 @@ def DSATUR(n_supernodes, sub_adjs, k):
     for vertices, neighbors, neighbors_idx, n in sub_adjs['others']:
         # Y is (n,d), Y2 is (n,1), C is (k, d) 
         colors = dsatur_color_numba(neighbors, neighbors_idx, n)
-        if max(colors) >= k:
-            return []
 
         for i, c in enumerate(colors):
             v = vertices[i]
             membership[v] = c
     return membership
+
 
 def sub_adj_classification(adj):
     """
