@@ -11,31 +11,6 @@ import cupy as cp
 
 @njit(cache=True, fastmath=True)
 def build_MWSP_core(D, neighbors, neighbors_idx, membership_vertices, k, n_vertices, n_swaps_cap):
-    """
-    Enumerate all improving Kempe chain swaps and their conflict structure for one connected
-    component of the cannot-link constraint graph (Numba-JIT).
-
-    A swap between clusters i and j is a maximal connected subgraph (Kempe chain) induced
-    on vertices currently colored i or j.  For each such chain the swap cost delta is
-    computed; only chains with delta < 0 (improving) are retained.  Two swaps conflict if
-    they share a vertex (clique constraint) or would place a cannot-link pair in the same
-    cluster (swap CL constraint).
-
-    Args:
-        D (float64[n_vertices, k]): Distance matrix; D[v, j] is the SSE contribution of
-            super-node v when assigned to cluster j.
-        neighbors (int64[:]): CSR-format flat neighbor list for the cannot-link subgraph.
-        neighbors_idx (uint64[n_vertices+1]): CSR row-pointer array.
-        membership_vertices (uint32[n_vertices]): Current cluster assignment (local indices).
-        k (int): Number of clusters.
-        n_vertices (int): Number of super-nodes in this component.
-        n_swaps_cap (int): Pre-allocated capacity for the swap arrays.
-
-    Returns:
-        Tuple of arrays encoding swaps (i/j cluster labels, Hi/Hj vertex sets in CSR
-        format, swap weights), per-vertex swap incidence lists, and conflict-pair arrays
-        (adj_swaps_u, adj_swaps_v) — all sliced to the actual number of swaps found.
-    """
     eps = 1e-6
     len_colors = np.zeros(k, dtype=np.uint32)
     color_class_arr = np.empty((k, n_vertices), dtype=np.uint32)
@@ -420,22 +395,6 @@ def dsatur_color_numba(neighbors, neighbors_idx, n):
 
 
 def InitAssign_Singletons_and_Cliques(membership, sub_adjs, D):
-    """
-    Perform the initial greedy assignment for singleton and clique components.
-
-    Singleton super-nodes are each assigned to their nearest cluster (argmin over D).
-    Clique components (fully-connected cannot-link groups) are assigned by solving a
-    linear assignment problem so that all k vertices in the clique land in distinct
-    clusters while minimising total SSE cost.
-
-    Args:
-        membership (int64[n_supernodes]): Cluster assignment array, modified in-place.
-        sub_adjs (dict): Component classification from sub_adj_classification.
-        D (float64[n_supernodes, k]): Distance matrix (SSE per super-node per cluster).
-
-    Returns:
-        membership (int64[n_supernodes]): Updated cluster assignments.
-    """
     verts = sub_adjs['singletons']
     D_verts = D[verts]
     best_j = np.argmin(D_verts, axis=1)
@@ -450,32 +409,16 @@ def InitAssign_Singletons_and_Cliques(membership, sub_adjs, D):
     return membership
 
 def Assign_Singletons_and_Cliques(membership, sub_adjs, D, n_s, eps = 1e-6):
-    """
-    Improve assignments for singleton and clique components during the descent loop.
-
-    Same logic as InitAssign_Singletons_and_Cliques, but moves are only applied when
-    they strictly reduce SSE (delta > eps).  The counter n_s is incremented each time
-    at least one vertex is reassigned, signalling that progress was made.
-
-    Args:
-        membership (int64[n_supernodes]): Cluster assignment array, modified in-place.
-        sub_adjs (dict): Component classification from sub_adj_classification.
-        D (float64[n_supernodes, k]): Distance matrix (SSE per super-node per cluster).
-        n_s (int): Running count of improving assignment moves made this iteration.
-        eps (float): Minimum cost reduction required to accept a move.
-
-    Returns:
-        membership (int64[n_supernodes]), n_s (int): Updated assignments and move count.
-    """
     verts = sub_adjs['singletons']
     D_verts = D[verts]
     best_j = np.argmin(D_verts, axis=1) 
     current_j = membership[verts]
     # move_mask = (current_j != best_j)
-    best_cost = D[verts, best_j[verts]]
-    current_cost = D[verts, current_j]
+    row_idx = np.arange(len(verts))
+    best_cost = D_verts[row_idx, best_j]
+    current_cost = D_verts[row_idx, current_j]
 
-    move_mask = (best_j[verts] != current_j) & (best_cost < current_cost - eps)
+    move_mask = (best_j != current_j) & (best_cost < current_cost - eps)
 
     moved_verts = verts[move_mask]
     if moved_verts.size:
@@ -501,34 +444,9 @@ def CentroidUpdate(
     random_centroid_scale = 0
 ):
     """
-    Fit per-cluster OLS regression centroids and compute the SSE distance matrix.
-
-    For each cluster j, fits B_j = argmin_B ||Y_j - X_j B||^2_F using least-squares.
-    The distance of super-node v to cluster j is then
-        D[v, j] = ||Y_v - X_v B_j||^2_F = YtY[v] - 2 tr(XtY[v]^T B_j) + tr(B_j^T XtX[v] B_j),
-    computed efficiently on GPU via batched einsum.
-
-    Empty clusters steal a randomly chosen super-node (weighted by super-node size) so
-    that every cluster always has at least one point.
-
-    Args:
-        membership (int64[n_supernodes]): Current cluster assignment of each super-node.
-        ml_map (int64[n]): Maps each data point index to its super-node index.
-        X (float64[n, q]): Feature matrix (with intercept column prepended by KSKM).
-        Y (float64[n, p]): Response matrix.
-        k (int): Number of clusters.
-        ml_array (int64[:]): Concatenated data-point indices for all super-nodes (CSR values).
-        ml_array_idxs (int64[n_supernodes+1]): CSR row-pointer for ml_array.
-        reposition (bool): If True, replace the best cluster's distance column with the
-            worst cluster's column, forcing the descent to explore a new neighbourhood.
-        rcond (float): Regularisation threshold for least-squares rank detection.
-        random_centroid_scale (float): If > 0, add scaled noise drawn from the null space
-            of X_j to B_j (centroid perturbation); residuals are invariant to this.
-
     Returns:
-        D (float64[n_supernodes, k]): SSE distance matrix.
-        total_ssr_rounded (float): Total sum of squared regression residuals over all
-            non-empty clusters (rounded to 5 decimal places).
+      if not reposition: (D, total_ssr_rounded)
+      if reposition: D (D, total_ssr_rounded), (with best column replaced by worst column)
     """
     def ols_fit_sse(Xj: np.ndarray, Yj: np.ndarray):
         """
@@ -541,22 +459,27 @@ def CentroidUpdate(
         random draw from the null space.  Residuals/SSE are invariant to this
         because X @ V_null = 0 by definition.
         """
-        Bj, *_ = np.linalg.lstsq(Xj, Yj, rcond=None)  # min-norm solution
-
         n, q = Xj.shape
-        _, s, Vt = np.linalg.svd(Xj, full_matrices=True)
-        tol  = s[0] * max(n, q) * np.finfo(float).eps if s.size else 0.0
-        rank = int(np.sum(s > tol))
+        Bj, res, rank, _ = np.linalg.lstsq(Xj, Yj, rcond=None)
+
+        # res is non-empty only when n > q and rank == q (lstsq docs).
+        # Residuals are invariant to null-space perturbation, so compute sse_col
+        # from the unperturbed Bj before the perturbation branch.
+        if res.size:
+            sse_col = res
+        else:
+            R = Yj - Xj @ Bj
+            sse_col = np.sum(R * R, axis=0)
+            # sse_col = 0
 
         if rank < q:                          # null space exists
-            null_scale = 10
+            # full_matrices=False: never allocates the (n×n) U matrix.
+            _, _, Vt = np.linalg.svd(Xj, full_matrices=True)
             V_null = Vt[rank:].T              # (q, null_dim)
             C      = np.random.randn(V_null.shape[1], Yj.shape[1])
-            Bj     = Bj + null_scale * V_null @ C          # random solution; residuals unchanged
+            Bj     = Bj + 10 * V_null @ C
 
-        R       = Yj - Xj @ Bj
-        sse_col = np.sum(R * R, axis=0)
-        dof     = n - rank
+        dof = n - rank
         return Bj, sse_col, dof
 
     def svd_L_for_pinv_xtx(Xj: np.ndarray, rcond=1e-12):
@@ -565,7 +488,7 @@ def CentroidUpdate(
         For Xj = U S V^T (thin SVD), (X^T X)^+ = V diag(1/S^2) V^T,
         so L can be V diag(1/S).
         """
-        U, S, Vt = np.linalg.svd(Xj, full_matrices=False)
+        _, S, Vt = np.linalg.svd(Xj, full_matrices=False)
         if S.size == 0:
             # degenerate: no columns? shouldn't happen for regression
             return np.zeros((Xj.shape[1], 0), dtype=Xj.dtype)
@@ -713,34 +636,10 @@ def CentroidUpdate(
     return D, round(total_ssr, 5)
 
 def KempeChainMWSP(k, membership, X, Y, sub_adjs, ml_array, ml_array_idxs, ml_map, deepest = False, verbose = True):
-    """
-    Run the full Kempe-swap descent loop until no improving swap exists.
-
-    Alternates between CentroidUpdate (refit OLS centroids and recompute D) and
-    KSAssignment (identify and apply improving Kempe swaps via MWIS).  Terminates
-    when KSAssignment finds no improving swap, i.e. a Kempe-swap local optimum is
-    reached with respect to the total regression SSE.
-
-    Args:
-        k (int): Number of clusters.
-        membership (int64[n_supernodes]): Current cluster assignments, updated in-place.
-        X (float64[n, q]): Feature matrix.
-        Y (float64[n, p]): Response matrix.
-        sub_adjs (dict): Component classification from sub_adj_classification.
-        ml_array (int64[:]): CSR values for super-node membership.
-        ml_array_idxs (int64[n_supernodes+1]): CSR row-pointers for ml_array.
-        ml_map (int64[n]): Maps data-point indices to super-node indices.
-        deepest (bool): If True, use KempeChainMutation_target_centroids (steepest
-            descent with a fixed D); if False use KSAssignment (one pass per D update).
-        verbose (bool): Print SSE at each centroid update.
-
-    Returns:
-        membership (int64[n_supernodes]): Locally optimal cluster assignments.
-    """
     while True:
         D, obj = CentroidUpdate(membership, ml_map, X, Y, k, ml_array, ml_array_idxs, reposition=False, rcond=1e-12, random_centroid_scale=0)
         if verbose:
-            print(str(obj) + ' swapping')
+            print(obj)
 
         if deepest:
             membership, n_s = KempeChainMutation_target_centroids(k, membership, sub_adjs, D)
@@ -751,25 +650,6 @@ def KempeChainMWSP(k, membership, X, Y, sub_adjs, ml_array, ml_array_idxs, ml_ma
             return membership
 
 def KempeChainMutation_target_centroids(k, membership, sub_adjs, D):
-    """
-    Apply KSAssignment repeatedly with a fixed distance matrix until convergence.
-
-    Used as the "deepest descent" variant of the assignment step: after each round of
-    swaps the membership changes can reveal new improving swaps under the same D, so
-    the process iterates until no further improvement is found.  This is also used
-    after centroid mutations (reposition/perturbation) to restore local optimality
-    without recomputing OLS centroids.
-
-    Args:
-        k (int): Number of clusters.
-        membership (int64[n_supernodes]): Current cluster assignments, modified in-place.
-        sub_adjs (dict): Component classification from sub_adj_classification.
-        D (float64[n_supernodes, k]): Fixed distance matrix for the current centroids.
-
-    Returns:
-        membership (int64[n_supernodes]), n_s (int): Updated assignments and total number
-            of improving swaps applied.
-    """
     n_s = 0
     while True:
         membership, n_s_inner = KSAssignment(k, membership, sub_adjs, D, skip_phases = n_s)
@@ -778,58 +658,11 @@ def KempeChainMutation_target_centroids(k, membership, sub_adjs, D):
             return membership, n_s
 
 def KempeChainMutation_distr(k, membership, X, Y, sub_adjs, ml_array, ml_array_idxs, ml_map, random_centroid_scale):
-    """
-    Apply centroid-perturbation mutation then restore local optimality via Kempe swaps.
-
-    Computes perturbed OLS regression centroids by adding noise scaled by
-    random_centroid_scale (see CentroidUpdate), then runs KempeChainMutation_target_centroids
-    with the resulting distance matrix.  Clusters with larger residuals receive stronger
-    perturbations, encouraging exploration in under-fit regions.
-
-    Args:
-        k (int): Number of clusters.
-        membership (int64[n_supernodes]): Current cluster assignments.
-        X (float64[n, q]): Feature matrix.
-        Y (float64[n, p]): Response matrix.
-        sub_adjs (dict): Component classification from sub_adj_classification.
-        ml_array (int64[:]): CSR values for super-node membership.
-        ml_array_idxs (int64[n_supernodes+1]): CSR row-pointers.
-        ml_map (int64[n]): Maps data-point indices to super-node indices.
-        random_centroid_scale (float): Noise scale for centroid perturbation.
-
-    Returns:
-        membership (int64[n_supernodes]): Updated cluster assignments.
-    """
     D, _ = CentroidUpdate(membership, ml_map, X, Y, k, ml_array, ml_array_idxs, random_centroid_scale = random_centroid_scale)
     membership, _ = KempeChainMutation_target_centroids(k, membership, sub_adjs, D)
     return membership
 
 def KSAssignment(k, membership, sub_adjs, D, skip_phases = False):
-    """
-    One round of constrained cluster assignment via Kempe-chain swaps (Algorithm 2).
-
-    For each connected component of the cannot-link graph:
-      - Singletons and cliques are handled by exact or linear-assignment rules.
-      - General components: build_MWSP_core enumerates all improving Kempe chains and
-        their conflict structure; a Gurobi MWIS (Maximum Weighted Independent Set) then
-        selects the compatible subset of swaps that maximally reduces total SSE while
-        preserving the feasible k-colouring.
-
-    For k == 2 the MWIS reduces to independent BFS traversals and is solved exactly
-    without Gurobi.
-
-    Args:
-        k (int): Number of clusters.
-        membership (int64[n_supernodes]): Cluster assignments, modified in-place.
-        sub_adjs (dict): Component classification from sub_adj_classification.
-        D (float64[n_supernodes, k]): Distance matrix (SSE per super-node per cluster).
-        skip_phases (bool | int): If truthy, skip the singleton/clique phase (used when
-            called repeatedly from KempeChainMutation_target_centroids).
-
-    Returns:
-        membership (int64[n_supernodes]), n_s (int): Updated assignments and number of
-            improving moves applied (0 signals local optimality).
-    """
     def apply_swaps(vertices, membership, chosen, swaps_i_array, swaps_j_array, swaps_Hi_array, swaps_Hj_array, swaps_Hi_index_array, swaps_Hj_index_array):
         cnt = ((swaps_Hi_index_array[chosen + 1] - swaps_Hi_index_array[chosen]).sum()
                 + (swaps_Hj_index_array[chosen + 1] - swaps_Hj_index_array[chosen]).sum()
@@ -966,7 +799,7 @@ def KSAssignment(k, membership, sub_adjs, D, skip_phases = False):
         for vertices, neighbors, neighbors_idx, n_vertices in sub_adjs['others']:
             D_vertices  = D[vertices]
             membership_vertices = membership[vertices]
-            n_swaps_cap = min(80000, int(n_vertices * (n_vertices - 1)/2))
+            n_swaps_cap = min(10000, int(n_vertices * (n_vertices - 1)/2))
             swaps_i_array, swaps_j_array, swaps_Hi_array, swaps_Hj_array, swaps_Hi_index_array, swaps_Hj_index_array, swaps_weights_array, points_in_swaps_arr, points_in_swaps_arr_idx, adj_swaps_u_array, adj_swaps_v_array = build_MWSP_core(D_vertices, neighbors, neighbors_idx, membership_vertices, k, n_vertices, n_swaps_cap)
             if swaps_i_array.size:
                 chosen = MWSP(swaps_weights_array, points_in_swaps_arr, points_in_swaps_arr_idx, adj_swaps_u_array, adj_swaps_v_array)
@@ -976,54 +809,6 @@ def KSAssignment(k, membership, sub_adjs, D, skip_phases = False):
     return membership, n_s
 
 def KSKM(random_state, X, Y, ml_supernodes, cl_supernodes, steps_mutation, k, steps_back_to_best = 3, steps_no_improvement = 10, verbose = False, time_limit = 3600, membership = None, reposition_frequency = 5, random_centroid_scale = 10, weight_supernodes = False):
-    """
-    Kempe Swap K-Means for Semi-Supervised Clusterwise Regression (KSKM-CLR).
-
-    Partitions n data points into k clusters, each fitted with its own OLS regression
-    model y = X * B_j, minimising the total sum of squared regression residuals (SSR)
-    subject to must-link and cannot-link constraints encoded as super-nodes and edges.
-
-    The algorithm iterates three phases:
-      1. Descent  – KempeChainMWSP alternates OLS centroid updates with Kempe-swap
-                    assignment (MWIS) until a local SSR optimum is reached.
-      2. Mutation – centroid perturbation (every reposition_frequency-th iteration) or
-                    centroid reposition are applied to escape local optima, followed by
-                    a fresh descent phase.
-      3. Tracking – the best membership found so far is stored; after steps_back_to_best
-                    non-improving mutations the algorithm reverts to the best solution,
-                    and terminates after steps_no_improvement total non-improving mutations.
-
-    Args:
-        random_state (int): NumPy random seed for reproducibility.
-        X (float64[n, q]): Feature matrix (intercept column is prepended internally).
-        Y (float64[n, p]): Response matrix.
-        ml_supernodes (list[list[int]]): Must-link super-nodes.  ml_supernodes[i] is the
-            list of 0-indexed data-point indices that form super-node i.  All points in a
-            super-node are forced into the same cluster.  Single-element lists represent
-            unconstrained data points.
-        cl_supernodes (list[tuple[int, int]]): Cannot-link super-node pairs.  Each tuple
-            (i, j) means super-node i and super-node j must be assigned to different
-            clusters.  Indices refer to positions in ml_supernodes.
-        steps_mutation (int): Maximum number of mutation iterations.
-        k (int): Number of clusters (regression components).
-        steps_back_to_best (int): Revert to best solution after this many consecutive
-            non-improving mutations.
-        steps_no_improvement (int): Terminate after this many total non-improving mutations.
-        verbose (bool): Print SSR at each descent step and mutation event.
-        time_limit (float): Wall-clock time limit in seconds.
-        membership (int64[n_supernodes] | None): Warm-start super-node assignments.
-            If None, DSATUR initialisation is used.
-        reposition_frequency (int): Apply centroid reposition every this many mutations;
-            otherwise apply centroid perturbation.
-        random_centroid_scale (float): Noise scale for centroid perturbation mutations.
-        weight_supernodes (bool): If True, weight each data point by 1/|super-node| so
-            that all super-nodes contribute equally to the OLS fit regardless of size.
-
-    Returns:
-        membership_final (int64[n]): Cluster label for each of the n data points (0-indexed).
-        membership (int64[n_supernodes]): Cluster label for each super-node; can be passed
-            back as a warm start.  Returns [] if no feasible initialisation was found.
-    """
     def KSKM_inner(k, membership, X, Y, sub_adjs, ml_array, ml_array_idxs, ml_map, steps_mutation, steps_back_to_best, steps_no_improvement, verbose = True, time_limit = time_limit, reposition_frequency = reposition_frequency, random_centroid_scale = random_centroid_scale, rcond=1e-5):
         start_time = time.time()
         count = 0
@@ -1084,14 +869,18 @@ def KSKM(random_state, X, Y, ml_supernodes, cl_supernodes, steps_mutation, k, st
     del adj, ml_supernodes, cl_supernodes
 
     print('Preprocessing Done')
-    
+
     if membership is None:
-        membership = DSATUR(n_supernodes, sub_adjs, k)
-        if not len(membership):
+        membership = DSATUR(n_supernodes, sub_adjs)
+
+    if k is None:
+        k = membership.max() + 5
+        print('number of clusters k = ', k)
+    else:
+        if membership.max() >= k:
             print('DSATUR solution infeasible')
             return []
-        print(membership.max())
-
+    
     if verbose:
         print('Initialization done')
     time_lefted = time_limit - time.time() + start_time
@@ -1100,23 +889,7 @@ def KSKM(random_state, X, Y, ml_supernodes, cl_supernodes, steps_mutation, k, st
     
     return membership_final, membership
 
-def DSATUR(n_supernodes, sub_adjs, k):
-    """
-    Initialise cluster assignments with the DSATUR graph-colouring heuristic.
-
-    Processes super-nodes in non-increasing order of saturation degree (number of
-    distinct neighbouring cluster colours) and assigns each to the smallest-index
-    permissible cluster.  Clique components are assigned via direct enumeration.
-    Returns an empty list if the graph's chromatic number exceeds k (infeasible).
-
-    Args:
-        n_supernodes (int): Total number of super-nodes.
-        sub_adjs (dict): Component classification from sub_adj_classification.
-        k (int): Number of clusters (colours).
-
-    Returns:
-        membership (int64[n_supernodes]): Initial cluster assignments, or [] if infeasible.
-    """
+def DSATUR(n_supernodes, sub_adjs):
     membership = np.zeros(n_supernodes, dtype = np.int64)
     for verts in sub_adjs['cliques']:
         for i, v in enumerate(verts):
@@ -1124,13 +897,12 @@ def DSATUR(n_supernodes, sub_adjs, k):
     for vertices, neighbors, neighbors_idx, n in sub_adjs['others']:
         # Y is (n,d), Y2 is (n,1), C is (k, d) 
         colors = dsatur_color_numba(neighbors, neighbors_idx, n)
-        if max(colors) >= k:
-            return []
 
         for i, c in enumerate(colors):
             v = vertices[i]
             membership[v] = c
     return membership
+
 
 def sub_adj_classification(adj):
     """
@@ -1212,28 +984,6 @@ def sub_adj_classification(adj):
 
 
 def preprocessing(n, cl_supernodes, ml_supernodes):
-    """
-    Convert super-node inputs into internal CSR arrays and the cannot-link adjacency list.
-
-    Builds:
-      - ml_array / ml_array_idxs: CSR representation mapping each super-node to its
-        member data-point indices.
-      - ml_map: reverse map from data-point index to super-node index.
-      - adj: adjacency list (list of sets) encoding cannot-link edges between super-nodes.
-
-    Args:
-        n (int): Total number of data points.
-        cl_supernodes (list[tuple[int, int]]): Cannot-link pairs of super-node indices.
-        ml_supernodes (list[list[int]]): List of super-nodes; ml_supernodes[i] contains
-            the 0-indexed data-point indices belonging to super-node i.
-
-    Returns:
-        adj (list[set]): Cannot-link adjacency list over super-nodes.
-        ml_map (int64[n]): Data-point to super-node index map.
-        n_supernodes (int): Number of super-nodes.
-        ml_array (int64[:]): Flat array of data-point indices (CSR values).
-        ml_array_idxs (int64[n_supernodes+1]): CSR row-pointers into ml_array.
-    """
     n_supernodes = len(ml_supernodes)
     ml_array_idxs = np.empty(n_supernodes+1, dtype = np.int64)
     ml_array_idxs[0] = 0
@@ -1254,19 +1004,6 @@ def preprocessing(n, cl_supernodes, ml_supernodes):
     return adj, ml_map, n_supernodes, ml_array, ml_array_idxs
 
 def recover_ml_from_membership(membership, ml_map):
-    """
-    Expand super-node cluster assignments back to individual data-point assignments.
-
-    Each data point inherits the cluster label of its super-node, so all points that
-    were must-linked together receive the same label.
-
-    Args:
-        membership (int64[n_supernodes]): Cluster label for each super-node.
-        ml_map (int64[n]): Maps each data-point index to its super-node index.
-
-    Returns:
-        membership_final (int64[n]): Cluster label for each of the n data points.
-    """
     n = ml_map.size
     membership_final = np.empty(n, dtype=ml_map.dtype)
     for i in range(n):
